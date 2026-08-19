@@ -69,6 +69,12 @@ PATH_GET_PUBLIC_KEY = "/uam/v2/mgr/getPublicKey"
 PATH_LOGIN = "/uam/v2/user/loginEmailAcounnt"
 PATH_DEVICES = "/uds/v1/protected/deviceinfos"
 
+# The accessToken from loginEmailAcounnt is bound to the clientId it was issued
+# for; sending a different clientId later makes deviceinfos reject it
+# (D00005 "Token不是由此应用创建"). One fixed clientId per run is reused for
+# every call and also seeds the MQTT gateway clientId derivation.
+CLIENT_ID = "haiergoodair" + "".join(str(secrets.randbelow(10)) for _ in range(8))
+
 
 def sha256hex(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
@@ -90,7 +96,7 @@ def build_headers(path: str, body: str, app_id: str, app_key: str,
         "Content-Type": "application/json;charset=utf-8",
         "appId": app_id,
         "appVersion": APP_VERSION,
-        "clientId": "haiergoodair" + str(secrets.randbelow(1000000)),
+        "clientId": CLIENT_ID,
         "timezone": "+8",
         "accessToken": access_token,
         "privacyVersion": "V1.0.0",
@@ -191,7 +197,7 @@ def _parse_localkey_response(payload: bytes) -> dict:
 
 
 def fetch_localkey(device_id: str, access_token: str,
-                   usdk_client_id: str = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4",
+                   usdk_client_id: str = CLIENT_ID,
                    timeout: float = 10.0) -> dict:
     """Fetch one device's localKey over the MQTT gateway."""
     username, password = _derive_gateway_auth()
@@ -202,7 +208,7 @@ def fetch_localkey(device_id: str, access_token: str,
     result: dict = {}
 
     def on_connect(c, _u, _f, rc, *_a):
-        if rc != mqtt.ReasonCode(mqtt.CONNACK_ACCEPTED):
+        if rc != 0:
             result["_error"] = f"MQTT CONNECT rc={rc}"
             return
         c.subscribe(sub_topic)

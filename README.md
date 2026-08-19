@@ -92,13 +92,37 @@ The password is prompted for interactively. Output:
 Done — you get a `climate.*` entity plus temperature, power, fault and other sensors,
 all polled locally every 30 s.
 
+### 4. Keep the key fresh automatically
+
+The AC rotates its localKey **several times a day**; when it does, Home Assistant
+shows the unit as unavailable until the stored key is updated. Instead of fetching by
+hand, run `haier_key_refresh.py` from cron:
+
+1. Create a `.env` (see `.env.example`) with your account credentials plus
+   `HA_STORAGE`, `HA_URL`, `HA_TOKEN` and — if the token is a "normal" type bound to
+   an OAuth client — `HA_CLIENT_ID` (e.g. `https://ha.pi.lan/`).
+2. Run it inside the container / from cron every 30 minutes:
+
+   ```bash
+   docker exec homeassistant sh -c "cd /config/haier && set -a && . ./.env && set +a \
+     && python3 /config/haier/haier_key_refresh.py"
+   ```
+
+   When the key changed, it patches `core.config_entries` and restarts Home Assistant
+   (a config-entry reload is not enough — HA serves entries from memory).
+   It exits `0` with "nothing to do" when the key is unchanged.
+
 ## Notes
 
 - **The key rotates.** An online unit is issued a new key several times a day, which
   is the single most common cause of "it worked then stopped". Two ways to stop it:
-  - add your Haier account to the integration once (it re-fetches automatically), or
+  - run `haier_key_refresh.py` from cron (above), or
   - block the AC's internet access at your router; a blocked unit's key stops changing,
     and your stored key stays valid indefinitely.
+- The `accessToken` from `loginEmailAcounnt` is **bound to the `clientId`** that the
+  login request was sent with. Both scripts therefore use one fixed `clientId` for the
+  whole run; a fresh random one per call makes `deviceinfos` reject the token with
+  `D00005 "Token不是由此应用创建"`.
 - Home Assistant and the AC must be able to reach each other on port 56800. If they are
   on different VLANs/subnets (e.g. IoT guest network), add a firewall rule allowing the
   traffic.
