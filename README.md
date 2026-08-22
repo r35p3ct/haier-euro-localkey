@@ -8,6 +8,10 @@ The AC is then driven with the excellent
 [`enapt/haismart-local`](https://github.com/enapt/haismart-local) integration, which
 speaks the local **uSS/HRDP** protocol on TCP port 56800.
 
+> **Полная инструкция на русском** — [FAQ.md](FAQ.md): подключение шаг за шагом,
+> добавление Турбо/Тихо/Подсветки/Комфортного потока для семейства compact-12,
+> решение проблем.
+
 ## Why this exists
 
 Haier has several phone apps, and they do **not** share one cloud:
