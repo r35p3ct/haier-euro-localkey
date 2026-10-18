@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """Automatically refresh the Haier U+ (Europe) AC localKey and patch Home Assistant.
 
-Re-runs the Europe login + uSDK MQTT gateway ``devLocalkey`` request and, when the
-returned key differs from the one stored in HA's ``core.config_entries``, rewrites
-the entry's ``local_key`` / ``localkey_version`` and restarts HA via its REST API
-(a config-entry reload is not enough: HA serves entries from memory). Meant to run
-from cron/systemd every ~30 min.
+NOTE (2026-10): Haier killed the UWS login endpoints (`/uam/v2/mgr/getPublicKey`,
+`/uam/v2/user/loginEmailAcounnt`) server-side — they return B00004 for the official
+app too. The working flow is now:
 
-Credentials come from the environment (no interactive prompts):
+    1. POST https://uhome.haieriot.net/uhome/acbiz/login  (plaintext password,
+       sign = md5(body+appId+appKey+sequenceId[:14]))  ->  accessToken
+    2. GET  https://uws-gea-euro.haieriot.net/uds/v1/protected/deviceinfos
+       (old sha256 sign, token from step 1)  ->  device list sanity check
+    3. MQTT gw-gea-euro.haieriot.net:56789 `devLocalkey`  ->  localKey + version
+
+When the fetched key differs from the one stored in HA's core.config_entries the
+entry is rewritten and HA restarted via its REST API. Meant for cron every ~30 min.
+
+Credentials come from the environment:
 
     HAISMART_APP_ID / HAISMART_APP_KEY   app-level app credentials
     HAISMART_USERNAME / HAISMART_PASSWORD  Haier account
+    HAISMART_DEVICE_ID  AC MAC/deviceId (or pass --device-id)
     HA_STORAGE  path to core.config_entries (default: /config/.storage/core.config_entries)
     HA_URL      Home Assistant base URL (default: http://localhost:8123)
     HA_TOKEN    HA refresh token (prefix "refresh:") or long-lived access token
@@ -24,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import hashlib
 import json
 import os
@@ -37,95 +46,87 @@ import urllib.request
 import httpx
 import paho.mqtt.client as mqtt
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 UWS_BASE = "https://uws-gea-euro.haieriot.net"
+UHOME_BASE = "https://uhome.haieriot.net"
 GATEWAY_HOST = "gw-gea-euro.haieriot.net"
 GATEWAY_PORT = 56789
 APP_PACKAGE = "com.haier.uhome.haiergoodairabroad"
-APP_VERSION = "3.3.3"
+APP_VERSION = "4.0.1"
 GATEWAY_AUTH_SALT = b"haier_sdk"
 GATEWAY_USERNAME_TAG = "01"
 
-PATH_GET_PUBLIC_KEY = "/uam/v2/mgr/getPublicKey"
-PATH_LOGIN = "/uam/v2/user/loginEmailAcounnt"
 PATH_DEVICES = "/uds/v1/protected/deviceinfos"
+PATH_ACBIZ_LOGIN = "/uhome/acbiz/login"
 
-# The accessToken from loginEmailAcounnt is bound to the clientId it was issued
-# for; sending a different clientId later makes deviceinfos reject it
-# (D00005 "Token不是由此应用创建"). One fixed clientId per run is reused for every
-# UWS call and also seeds the MQTT gateway clientId derivation.
-CLIENT_ID = "haiergoodair" + "".join(str(secrets.randbelow(10)) for _ in range(8))
+APP_ID = os.environ.get("HAISMART_APP_ID", "")
+APP_KEY = os.environ.get("HAISMART_APP_KEY", "")
 
-
-def sha256hex(s: str) -> str:
-    return hashlib.sha256(s.encode()).hexdigest()
-
-
-def sign(path: str, body: str, timestamp: str, app_id: str, app_key: str) -> str:
-    b = body.replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
-    return sha256hex(path + b + app_id + app_key + timestamp)
+# 32-hex client id in the app's dcid format. The accessToken is bound to the
+# clientId sent at login, so one value per run is generated here and reused for
+# every call. Set HAISMART_CLIENT_ID to pin it.
+CLIENT_ID = os.environ.get("HAISMART_CLIENT_ID") or secrets.token_hex(16).upper()
 
 
-def build_headers(path, body, app_id, app_key, access_token="", client_id=CLIENT_ID):
+def seqid() -> str:
+    return datetime.datetime.now().strftime("%Y%m%d%H%M%S") + f"{secrets.randbelow(1000000):06d}"
+
+
+def _squash(s: str) -> str:
+    return s.replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
+
+
+def acbiz_headers(body: str) -> dict:
+    s = seqid()
     ts = str(int(time.time() * 1000))
+    sign = hashlib.md5((_squash(body) + APP_ID + APP_KEY + s[:14]).encode()).hexdigest().lower()
     return {
-        "Content-Type": "application/json;charset=utf-8",
-        "appId": app_id,
-        "appVersion": APP_VERSION,
-        "clientId": client_id,
-        "timezone": "+8",
-        "accessToken": access_token,
-        "privacyVersion": "V1.0.0",
-        "language": "en",
-        "User-Agent": "Apache-HttpClient/4.2.6 (java 1.5)",
-        "sequenceId": ts + "000000",
-        "timestamp": ts,
-        "sign": sign(path, body, ts, app_id, app_key),
+        "Content-Type": "application/json; charset=UTF-8",
+        "appId": APP_ID, "appKey": APP_KEY, "appVersion": APP_VERSION,
+        "clientId": CLIENT_ID, "language": "en", "timezone": "+00:00",
+        "accessToken": "", "sequenceId": s, "timestamp": ts,
+        "sign": sign, "privacyVersion": "V1.0.0",
+        "User-Agent": "okhttp/3.8.0",
     }
 
 
-def rsa_encrypt(plain: str, public_key_b64: str) -> str:
-    der = base64.b64decode(public_key_b64.replace(" ", "").replace("\n", ""))
-    pub = serialization.load_der_public_key(der)
-    enc = pub.encrypt(plain.encode("utf-8"), asym_padding.PKCS1v15())
-    return base64.b64encode(enc).decode()
+def uws_headers(path: str, body: str, token: str) -> dict:
+    s = seqid()
+    ts = str(int(time.time() * 1000))
+    sign = hashlib.sha256((path + _squash(body) + APP_ID + APP_KEY + ts).encode()).hexdigest().lower()
+    return {
+        "Content-Type": "application/json;charset=utf-8",
+        "appId": APP_ID, "appVersion": APP_VERSION, "clientId": CLIENT_ID,
+        "timezone": "+00:00", "accessToken": token, "sequenceId": s,
+        "timestamp": ts, "sign": sign, "language": "en",
+        "privacyVersion": "V1.0.0",
+        "User-Agent": "Apache-HttpClient/4.2.6 (java 1.5)",
+    }
 
 
-def login(app_id, app_key, username, password):
+def login(username: str, password: str) -> str:
+    """Login via the still-working uhome/acbiz endpoint (plaintext password)."""
     with httpx.Client(verify=False, timeout=30.0) as c:
-        h = build_headers(PATH_GET_PUBLIC_KEY, "", app_id, app_key)
-        r = c.post(UWS_BASE + PATH_GET_PUBLIC_KEY, content="", headers=h)
-        r.raise_for_status()
-        j = r.json()
-        pub = j.get("publicKey") or (j.get("data") or {}).get("publicKey")
-        if not pub:
-            raise RuntimeError(f"no publicKey in response: {r.text[:200]}")
-
-        body = json.dumps({
-            "email": rsa_encrypt(username, pub),
-            "password": rsa_encrypt(password, pub),
-            "captcha": "",
-        }, separators=(",", ":"))
-        h = build_headers(PATH_LOGIN, body, app_id, app_key)
-        r = c.post(UWS_BASE + PATH_LOGIN, content=body, headers=h)
-        r.raise_for_status()
-        j = r.json()
-        if j.get("retCode") != "00000":
-            raise RuntimeError(f"login failed: {j}")
-        token = j.get("accessToken")
-        if not token:
-            raise RuntimeError(f"login returned no accessToken: {r.text[:200]}")
-        return token
+        j: dict = {}
+        for login_type in (2, 0, 1):
+            body = json.dumps({
+                "loginId": username, "password": password,
+                "accType": 0, "loginType": login_type, "sequenceId": seqid(),
+            }, separators=(",", ":"))
+            r = c.post(UHOME_BASE + PATH_ACBIZ_LOGIN, content=body,
+                       headers=acbiz_headers(body))
+            j = r.json()
+            token = j.get("accessToken") or (j.get("data") or {}).get("accessToken")
+            if token:
+                return token
+        raise RuntimeError(f"acbiz login failed: {j}")
 
 
-def list_devices(app_id, app_key, access_token):
+def list_devices(access_token: str):
     with httpx.Client(verify=False, timeout=30.0) as c:
-        h = build_headers(PATH_DEVICES, "", app_id, app_key, access_token)
-        r = c.get(UWS_BASE + PATH_DEVICES, headers=h)
-        r.raise_for_status()
+        r = c.get(UWS_BASE + PATH_DEVICES,
+                  headers=uws_headers(PATH_DEVICES, "", access_token))
         j = r.json()
         return j.get("deviceinfos", []) or []
 
@@ -136,15 +137,6 @@ def _derive_gateway_password(username_body: str) -> str:
     key = hashlib.md5(username_body.encode()).digest()
     enc = Cipher(algorithms.AES(key), modes.CBC(b"\x00" * 16)).encryptor()
     return (enc.update(block) + enc.finalize()).hex()
-
-
-def _derive_gateway_auth():
-    body = "".join(str(secrets.randbelow(10)) for _ in range(8))
-    return GATEWAY_USERNAME_TAG + body, _derive_gateway_password(body)
-
-
-def _derive_client_id(usdk_client_id: str, package: str) -> str:
-    return hashlib.md5(f"{usdk_client_id}_{package}".encode()).hexdigest()
 
 
 def _localkey_request(device_id: str, access_token: str, sn: int = 1) -> str:
@@ -165,10 +157,12 @@ def _parse_localkey_response(payload: bytes) -> dict:
         return {}
 
 
-def fetch_localkey(device_id, access_token, usdk_client_id=CLIENT_ID,
-                   timeout=12.0):
-    username, password = _derive_gateway_auth()
-    client_id = _derive_client_id(usdk_client_id, APP_PACKAGE)
+def fetch_localkey(device_id, access_token, timeout=12.0):
+    body = "".join(str(secrets.randbelow(10)) for _ in range(8))
+    username = GATEWAY_USERNAME_TAG + body
+    password = _derive_gateway_password(body)
+    usdk_client_id = "haiergoodair" + "".join(str(secrets.randbelow(10)) for _ in range(8))
+    client_id = hashlib.md5(f"{usdk_client_id}_{APP_PACKAGE}".encode()).hexdigest()
     sub_topic = f"Client/{client_id}/Business/Down"
     pub_topic = f"Client/{client_id}/Business/Up"
 
@@ -266,7 +260,8 @@ def mint_access_token(ha_url, refresh_token, client_id=None) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device-id", default="04FA83819095", help="AC MAC/deviceId")
+    ap.add_argument("--device-id", default=os.environ.get("HAISMART_DEVICE_ID", ""),
+                    help="AC MAC/deviceId (or env HAISMART_DEVICE_ID)")
     ap.add_argument("--storage", default=os.environ.get("HA_STORAGE",
                     "/config/.storage/core.config_entries"))
     ap.add_argument("--ha-url", default=os.environ.get("HA_URL", "http://localhost:8123"))
@@ -274,19 +269,21 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
-    app_id = os.environ.get("HAISMART_APP_ID")
-    app_key = os.environ.get("HAISMART_APP_KEY")
     username = os.environ.get("HAISMART_USERNAME")
     password = os.environ.get("HAISMART_PASSWORD")
-    if not all((app_id, app_key, username, password)):
+    if not all((APP_ID, APP_KEY, username, password)):
         print("error: set HAISMART_APP_ID/APP_KEY/USERNAME/PASSWORD", file=sys.stderr)
+        return 2
+    if not args.device_id:
+        print("error: --device-id (or env HAISMART_DEVICE_ID) is required",
+              file=sys.stderr)
         return 2
 
     out = {"device_id": args.device_id}
 
     try:
-        token = login(app_id, app_key, username, password)
-        devices = list_devices(app_id, app_key, token)
+        token = login(username, password)
+        devices = list_devices(token)
     except Exception as err:  # noqa: BLE001
         out["error"] = f"cloud: {err}"
         print(json.dumps(out) if args.json else out["error"], file=sys.stderr)

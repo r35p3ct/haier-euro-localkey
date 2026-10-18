@@ -4,9 +4,15 @@
 Haier's "Good Air" / Haier U+ app (package ``com.haier.uhome.haiergoodairabroad``)
 uses a **different cloud** from the South-East Asia app that
 `enapt/haismart-local <https://github.com/enapt/haismart-local>`_ targets. This
-script reproduces the Europe login (RSA-encrypted credentials) and the uSDK MQTT
-gateway ``devLocalkey`` request, and prints the ``local_key`` you paste into the
-Haismart integration's *"I already have this unit's local key"* screen.
+script reproduces the Europe login and the uSDK MQTT gateway ``devLocalkey``
+request, and prints the ``local_key`` you paste into the Haismart integration's
+*"I already have this unit's local key"* screen.
+
+NOTE (2026-10): Haier disabled the UWS v2 login endpoints
+(``/uam/v2/mgr/getPublicKey`` + ``/uam/v2/user/loginEmailAcounnt``) server-side;
+they now return B00004 even for the official app. The login therefore goes
+through the still-working ``uhome/acbiz/login`` endpoint (plaintext password,
+md5 signature) and the resulting accessToken is accepted by the UWS device list.
 
 The AC itself is then controlled fully locally over TCP port 56800 (uSS/HRDP
 protocol) — no cloud, no hardware mods.
@@ -37,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import getpass
 import hashlib
 import json
@@ -48,109 +55,97 @@ import time
 import httpx
 import paho.mqtt.client as mqtt
 import ssl
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 # ---------------------------------------------------------------------------
 # Europe (Good Air / Haier U+) cloud endpoints — reverse-engineered from the
-# official Android app v3.3.3.
+# official Android app v4.0.1.
 # ---------------------------------------------------------------------------
 
 UWS_BASE = "https://uws-gea-euro.haieriot.net"
+UHOME_BASE = "https://uhome.haieriot.net"
 GATEWAY_HOST = "gw-gea-euro.haieriot.net"
 GATEWAY_PORT = 56789
 APP_PACKAGE = "com.haier.uhome.haiergoodairabroad"
-APP_VERSION = "3.3.3"
+APP_VERSION = "4.0.1"
 GATEWAY_AUTH_SALT = b"haier_sdk"
 GATEWAY_USERNAME_TAG = "01"
 
 # Paths
-PATH_GET_PUBLIC_KEY = "/uam/v2/mgr/getPublicKey"
-PATH_LOGIN = "/uam/v2/user/loginEmailAcounnt"
 PATH_DEVICES = "/uds/v1/protected/deviceinfos"
+PATH_ACBIZ_LOGIN = "/uhome/acbiz/login"
 
-# The accessToken from loginEmailAcounnt is bound to the clientId it was issued
-# for; sending a different clientId later makes deviceinfos reject it
-# (D00005 "Token不是由此应用创建"). One fixed clientId per run is reused for
-# every call and also seeds the MQTT gateway clientId derivation.
-CLIENT_ID = "haiergoodair" + "".join(str(secrets.randbelow(10)) for _ in range(8))
-
-
-def sha256hex(s: str) -> str:
-    return hashlib.sha256(s.encode()).hexdigest()
+# The accessToken is bound to the clientId sent at login; one random 32-hex
+# value per run is reused for every call.
+CLIENT_ID = secrets.token_hex(16).upper()
 
 
-def sign(path: str, body: str, timestamp: str, app_id: str, app_key: str) -> str:
-    """Reproduce the app's GDPR-header signature for the uws-gea-euro API.
-
-    SHA-256(path + whitespace-stripped-body + appId + appKey + timestamp), lowercase hex.
-    """
-    b = body.replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
-    return sha256hex(path + b + app_id + app_key + timestamp)
+def seqid() -> str:
+    return datetime.datetime.now().strftime("%Y%m%d%H%M%S") + f"{secrets.randbelow(1000000):06d}"
 
 
-def build_headers(path: str, body: str, app_id: str, app_key: str,
-                  access_token: str = "") -> dict[str, str]:
+def _squash(s: str) -> str:
+    return s.replace(" ", "").replace("\t", "").replace("\r", "").replace("\n", "")
+
+
+def acbiz_headers(app_id: str, app_key: str, body: str) -> dict[str, str]:
+    """Headers/sign for the uhome acbiz API (sign = md5 over squashed body)."""
+    s = seqid()
     ts = str(int(time.time() * 1000))
+    sign = hashlib.md5((_squash(body) + app_id + app_key + s[:14]).encode()).hexdigest().lower()
     return {
-        "Content-Type": "application/json;charset=utf-8",
-        "appId": app_id,
-        "appVersion": APP_VERSION,
-        "clientId": CLIENT_ID,
-        "timezone": "+8",
-        "accessToken": access_token,
-        "privacyVersion": "V1.0.0",
-        "language": "en",
-        "User-Agent": "Apache-HttpClient/4.2.6 (java 1.5)",
-        "sequenceId": ts + "000000",
-        "timestamp": ts,
-        "sign": sign(path, body, ts, app_id, app_key),
+        "Content-Type": "application/json; charset=UTF-8",
+        "appId": app_id, "appKey": app_key, "appVersion": APP_VERSION,
+        "clientId": CLIENT_ID, "language": "en", "timezone": "+00:00",
+        "accessToken": "", "sequenceId": s, "timestamp": ts,
+        "sign": sign, "privacyVersion": "V1.0.0",
+        "User-Agent": "okhttp/3.8.0",
     }
 
 
-def rsa_encrypt(plain: str, public_key_b64: str) -> str:
-    """Encrypt with the cloud-issued RSA public key (base64 DER, PKCS#1 v1.5)."""
-    der = base64.b64decode(public_key_b64.replace(" ", "").replace("\n", ""))
-    pub = serialization.load_der_public_key(der)
-    enc = pub.encrypt(plain.encode("utf-8"), padding.PKCS1v15())
-    return base64.b64encode(enc).decode()
+def uws_headers(path: str, body: str, app_id: str, app_key: str,
+                access_token: str) -> dict[str, str]:
+    """Headers/sign for the GDPR/uws-gea-euro API (sign = sha256 over path+body)."""
+    s = seqid()
+    ts = str(int(time.time() * 1000))
+    sign = hashlib.sha256((path + _squash(body) + app_id + app_key + ts).encode()).hexdigest().lower()
+    return {
+        "Content-Type": "application/json;charset=utf-8",
+        "appId": app_id, "appVersion": APP_VERSION, "clientId": CLIENT_ID,
+        "timezone": "+00:00", "accessToken": access_token, "sequenceId": s,
+        "timestamp": ts, "sign": sign, "language": "en",
+        "privacyVersion": "V1.0.0",
+        "User-Agent": "Apache-HttpClient/4.2.6 (java 1.5)",
+    }
 
 
 def login(app_id: str, app_key: str, username: str, password: str) -> str:
-    """Sign in and return the accessToken."""
-    with httpx.Client(verify=False, timeout=30.0) as c:
-        # 1. fetch the RSA public key
-        h = build_headers(PATH_GET_PUBLIC_KEY, "", app_id, app_key)
-        r = c.post(UWS_BASE + PATH_GET_PUBLIC_KEY, content="", headers=h)
-        r.raise_for_status()
-        j = r.json()
-        pub = j.get("publicKey") or (j.get("data") or {}).get("publicKey")
-        if not pub:
-            raise RuntimeError(f"no publicKey in response: {r.text[:200]}")
+    """Sign in via uhome/acbiz/login and return the accessToken.
 
-        # 2. login with RSA-encrypted email + password
-        body = json.dumps({
-            "email": rsa_encrypt(username, pub),
-            "password": rsa_encrypt(password, pub),
-            "captcha": "",
-        }, separators=(",", ":"))
-        h = build_headers(PATH_LOGIN, body, app_id, app_key)
-        r = c.post(UWS_BASE + PATH_LOGIN, content=body, headers=h)
-        r.raise_for_status()
-        j = r.json()
-        if j.get("retCode") != "00000":
-            raise RuntimeError(f"login failed: {j}")
-        token = j.get("accessToken")
-        if not token:
-            raise RuntimeError(f"login returned no accessToken: {r.text[:200]}")
-        return token
+    loginType=2 is the email account type; 0/1 (phone/userId) are tried as
+    fallback in case Haier shuffles the codes again.
+    """
+    with httpx.Client(verify=False, timeout=30.0) as c:
+        j: dict = {}
+        for login_type in (2, 0, 1):
+            body = json.dumps({
+                "loginId": username, "password": password,
+                "accType": 0, "loginType": login_type, "sequenceId": seqid(),
+            }, separators=(",", ":"))
+            r = c.post(UHOME_BASE + PATH_ACBIZ_LOGIN, content=body,
+                       headers=acbiz_headers(app_id, app_key, body))
+            j = r.json()
+            token = j.get("accessToken") or (j.get("data") or {}).get("accessToken")
+            if token:
+                return token
+        raise RuntimeError(f"acbiz login failed: {j}")
 
 
 def list_devices(app_id: str, app_key: str, access_token: str) -> list[dict]:
     """Return the account's devices (deviceId, wifiType, deviceType, ...)."""
     with httpx.Client(verify=False, timeout=30.0) as c:
-        h = build_headers(PATH_DEVICES, "", app_id, app_key, access_token)
-        r = c.get(UWS_BASE + PATH_DEVICES, headers=h)
+        r = c.get(UWS_BASE + PATH_DEVICES,
+                  headers=uws_headers(PATH_DEVICES, "", app_id, app_key, access_token))
         r.raise_for_status()
         j = r.json()
         return j.get("deviceinfos", []) or []
@@ -163,7 +158,6 @@ def list_devices(app_id: str, app_key: str, access_token: str) -> list[dict]:
 def _derive_gateway_password(username_body: str) -> str:
     block = len(GATEWAY_AUTH_SALT).to_bytes(2, "big") + GATEWAY_AUTH_SALT
     block += b"\x00" * (-len(block) % 16)
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     key = hashlib.md5(username_body.encode()).digest()
     enc = Cipher(algorithms.AES(key), modes.CBC(b"\x00" * 16)).encryptor()
     return (enc.update(block) + enc.finalize()).hex()

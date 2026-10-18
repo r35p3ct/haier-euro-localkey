@@ -109,8 +109,11 @@ hand, run `haier_key_refresh.py` from cron:
 
    ```bash
    docker exec homeassistant sh -c "cd /config/haier && set -a && . ./.env && set +a \
-     && python3 /config/haier/haier_key_refresh.py"
+     && python3 /config/haier/haier_key_refresh.py --device-id XXXXXXXXXXXX"
    ```
+
+   (`XXXXXXXXXXXX` is the AC's device ID = its MAC without colons, shown by
+   `haier_euro_keys.py`; or set `HAISMART_DEVICE_ID` in the `.env` and drop the flag.)
 
    When the key changed, it patches `core.config_entries` and restarts Home Assistant
    (a config-entry reload is not enough — HA serves entries from memory).
@@ -123,9 +126,9 @@ hand, run `haier_key_refresh.py` from cron:
   - run `haier_key_refresh.py` from cron (above), or
   - block the AC's internet access at your router; a blocked unit's key stops changing,
     and your stored key stays valid indefinitely.
-- The `accessToken` from `loginEmailAcounnt` is **bound to the `clientId`** that the
-  login request was sent with. Both scripts therefore use one fixed `clientId` for the
-  whole run; a fresh random one per call makes `deviceinfos` reject the token with
+- The `accessToken` is **bound to the `clientId`** that the login request was sent
+  with. Both scripts therefore generate one random `clientId` per run and reuse it for
+  every call; sending a different one later makes `deviceinfos` reject the token with
   `D00005 "Token不是由此应用创建"`.
 - Home Assistant and the AC must be able to reach each other on port 56800. If they are
   on different VLANs/subnets (e.g. IoT guest network), add a firewall rule allowing the
@@ -135,12 +138,19 @@ hand, run `haier_key_refresh.py` from cron:
 
 ## How it works
 
-1. `GET /uam/v2/mgr/getPublicKey` → RSA public key.
-2. `POST /uam/v2/user/loginEmailAcounnt` with RSA-encrypted email + password → `accessToken`.
-3. `GET /uds/v1/protected/deviceinfos` → device list.
-4. MQTT gateway `gw-gea-euro.haieriot.net:56789` (`devLocalkey` request) → `local_key`.
+> **2026-10 update:** Haier disabled the UWS v2 login endpoints
+> (`/uam/v2/mgr/getPublicKey`, `/uam/v2/user/loginEmailAcounnt`) server-side — they
+> return `B00004` even for the official app (verified by intercepting the app's own
+> traffic). The login now goes through the still-working `uhome/acbiz/login` endpoint.
 
-Everything is reverse-engineered from the official app v3.3.3; see the source for the
+1. `POST https://uhome.haieriot.net/uhome/acbiz/login` with plaintext email +
+   password (`loginType=2`) → `accessToken`. Signature: md5 of the whitespace-squashed
+   body + appId + appKey + first 14 chars of `sequenceId`.
+2. `GET /uds/v1/protected/deviceinfos` on `uws-gea-euro.haieriot.net` (old sha256
+   path+body signature, token from step 1) → device list.
+3. MQTT gateway `gw-gea-euro.haieriot.net:56789` (`devLocalkey` request) → `local_key`.
+
+Everything is reverse-engineered from the official app v4.0.1; see the source for the
 full header/signature logic.
 
 ## License
